@@ -17,9 +17,9 @@ logger = logging.getLogger("launchoutreach-backend")
 load_dotenv()
 
 app = FastAPI(
-    title="YC Startup Discovery Engine Backend",
-    description="Core API engine for sourcing active YC startups and generating AI engineering summaries.",
-    version="1.0.0"
+    title="YC Startup Job-Hunter Discovery Engine Backend",
+    description="API engine for sourcing active, growing YC startups and identifying target candidates for application.",
+    version="1.1.0"
 )
 
 # CORS Setup: Allow all origins so frontend can communicate
@@ -55,24 +55,21 @@ async def generate_company_summary(client: genai.Client, company: Dict[str, Any]
     name = company.get("name", "Unknown Company")
     one_liner = company.get("one_liner", "")
     description = company.get("long_description", "")
-    website = company.get("website", "")
     tags = company.get("tags", [])
     
     prompt = (
-        "You are an expert technical analyst. Write a precise, exactly 2-sentence technical summary "
-        "explaining the core engineering/technical innovation of this startup. Focus on *how* they build it, "
-        "their architecture, stack, or core technical value proposition. Do not include marketing fluff.\n\n"
+        "You are an expert technical recruiter. Analyze the following startup details "
+        "and generate a clean, exactly 2-sentence summary answering:\n"
+        "1. What core engineering/technical solution do they solve?\n"
+        "2. What specific kind of technical applicants or engineers would thrive here (e.g. background, stack, mindset)?\n\n"
         f"Startup Name: {name}\n"
         f"One-liner: {one_liner}\n"
         f"Description: {description}\n"
-        f"Website: {website}\n"
         f"Tags: {', '.join(tags)}\n\n"
-        "Remember, your output must be exactly two sentences."
+        "Remember, your output must be exactly two sentences and contain no markdown formatting or labels."
     )
     
     try:
-        # Since client.models.generate_content is synchronous, we run it in a thread pool
-        # to prevent blocking the event loop, allowing 5 API requests to execute in parallel.
         response = await asyncio.to_thread(
             client.models.generate_content,
             model="gemini-3.1-flash-lite",
@@ -84,10 +81,18 @@ async def generate_company_summary(client: genai.Client, company: Dict[str, Any]
         logger.error(f"Gemini API error for {name}: {e}")
         return "Failed to generate technical summary due to API error."
 
+def parse_batch_year(batch_str: str) -> int:
+    if not batch_str:
+        return 0
+    for token in batch_str.split():
+        if token.isdigit() and len(token) == 4:
+            return int(token)
+    return 0
+
 # Endpoint 2: GET /api/discover-startups
 @app.get("/api/discover-startups")
 async def discover_startups():
-    logger.info("Startup discovery pipeline triggered")
+    logger.info("Startup job-hunter pipeline triggered")
 
     # a) Fetch master JSON from YC index
     yc_url = "https://yc-oss.github.io/api/companies/all.json"
@@ -103,47 +108,58 @@ async def discover_startups():
     if not isinstance(companies, list):
         raise HTTPException(status_code=502, detail="YC database returned invalid JSON schema.")
 
-    # b) Filter for "Active" companies
+    # b) Filter active companies
     active_companies = [c for c in companies if c.get("status") == "Active"]
     if not active_companies:
         raise HTTPException(status_code=404, detail="No active companies found in the YC database.")
 
-    # c) Partition companies based on priority tags
-    priority_keywords = {"ai", "robotics", "developer tools", "artificial intelligence", "developer-tools", "dev tools", "machine learning", "ml"}
+    # c) Parse batch years and determine maximum year to find newest batches
+    active_companies.sort(key=lambda x: parse_batch_year(x.get("batch")), reverse=True)
     
-    priority_companies = []
-    other_companies = []
+    # Target the newest high-growth batches (max_year and max_year - 1, e.g., 2025/2026)
+    max_year = parse_batch_year(active_companies[0].get("batch"))
+    newest_companies = [c for c in active_companies if parse_batch_year(c.get("batch")) >= max_year - 2]
     
-    for c in active_companies:
-        tags = [t.lower() for t in c.get("tags", [])]
-        is_priority = any(keyword in tags for keyword in priority_keywords)
-        if is_priority:
-            priority_companies.append(c)
-        else:
-            other_companies.append(c)
-            
-    # Shuffle lists to ensure dynamic results on every call
-    random.shuffle(priority_companies)
+    if not newest_companies:
+        newest_companies = active_companies[:100]
+
+    # Prioritize companies that are actively looking for candidates (isHiring is True)
+    hiring_companies = [c for c in newest_companies if c.get("isHiring") is True]
+    other_companies = [c for c in newest_companies if c.get("isHiring") is not True]
+    
+    # Shuffle to ensure dynamic discoveries
+    random.shuffle(hiring_companies)
     random.shuffle(other_companies)
     
-    # Grab 5 startups, prioritizing the priority tags
-    selected_companies = (priority_companies + other_companies)[:5]
-    
+    selected_companies = (hiring_companies + other_companies)[:5]
+
     # d) Fetch GenAI Client
     client = get_genai_client()
-    
+
     # e) Generate 2-sentence technical summaries in parallel
     tasks = [generate_company_summary(client, c) for c in selected_companies]
     summaries = await asyncio.gather(*tasks)
-    
+
     # f) Formulate final JSON response array
     results = []
     for i, c in enumerate(selected_companies):
+        name = c.get("name", "Unknown Company")
+        batch = c.get("batch", "Unknown Batch")
+        logo = c.get("small_logo_thumb_url") or ""
+        website = c.get("website") or ""
+        
+        # Build direct-to-careers url or fall back to YC WorkAtAStartup
+        jobs_url = f"{website.rstrip('/')}/careers" if website else "https://www.ycombinator.com/jobs/role/"
+        contact_location = c.get("all_locations") or "Remote / San Francisco"
+        
         results.append({
-            "name": c.get("name", "Unknown Company"),
-            "batch": c.get("batch", "Unknown Batch"),
-            "website": c.get("website", ""),
-            "summary": summaries[i]
+            "name": name,
+            "batch": batch,
+            "logo": logo,
+            "website": website,
+            "jobs_url": jobs_url,
+            "contact_location": contact_location,
+            "AI_summary": summaries[i]
         })
         
     logger.info(f"Successfully processed and generated summaries for {len(results)} startups")
