@@ -170,8 +170,8 @@ def parse_batch_year(batch_str: str) -> int:
 
 # Endpoint 2: GET /api/discover-startups
 @app.get("/api/discover-startups")
-async def discover_startups():
-    logger.info("Startup job-hunter pipeline triggered")
+async def discover_startups(country: str = "All"):
+    logger.info(f"Startup job-hunter pipeline triggered with country filter: {country}")
 
     # a) Fetch master JSON from YC index
     yc_url = "https://yc-oss.github.io/api/companies/all.json"
@@ -191,6 +191,34 @@ async def discover_startups():
     active_companies = [c for c in companies if c.get("status") == "Active"]
     if not active_companies:
         raise HTTPException(status_code=404, detail="No active companies found in the YC database.")
+
+    # Apply geographical filter if country is not "All"
+    if country.strip().lower() != "all":
+        filtered_by_country = []
+        country_lower = country.strip().lower()
+        for c in active_companies:
+            loc_fields = [
+                c.get("all_locations"),
+                c.get("location"),
+                c.get("country"),
+                c.get("hq"),
+                c.get("city"),
+                c.get("regions")
+            ]
+            loc_strings = []
+            for lf in loc_fields:
+                if isinstance(lf, str):
+                    loc_strings.append(lf)
+                elif isinstance(lf, list):
+                    loc_strings.extend(str(item) for item in lf if item)
+            loc_combined = ", ".join(loc_strings).lower()
+            if country_lower in loc_combined:
+                filtered_by_country.append(c)
+        active_companies = filtered_by_country
+
+        if not active_companies:
+            logger.info(f"No active companies found matching country: {country}")
+            return []
 
     # c) Parse batch years and determine maximum year to find newest batches
     active_companies.sort(key=lambda x: parse_batch_year(x.get("batch")), reverse=True)
