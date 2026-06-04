@@ -81,6 +81,40 @@ async def generate_company_summary(client: genai.Client, company: Dict[str, Any]
         logger.error(f"Gemini API error for {name}: {e}")
         return "Failed to generate technical summary due to API error."
 
+def extract_github_url(company: Dict[str, Any]) -> str | None:
+    # 1. Check 'github' field
+    github_val = company.get("github")
+    if github_val and isinstance(github_val, str):
+        github_val = github_val.strip()
+        if "github.com" in github_val.lower():
+            return github_val
+        cleaned = github_val.strip("/")
+        if cleaned:
+            return f"https://github.com/{cleaned}"
+
+    # 2. Check 'website' field
+    website_val = company.get("website")
+    if website_val and isinstance(website_val, str):
+        website_val = website_val.strip()
+        if "github.com" in website_val.lower():
+            return website_val
+
+    # 3. Check 'links' field/array
+    links_val = company.get("links")
+    if isinstance(links_val, list):
+        for link in links_val:
+            if isinstance(link, str):
+                link = link.strip()
+                if "github.com" in link.lower():
+                    return link
+            elif isinstance(link, dict):
+                for val in link.values():
+                    if isinstance(val, str):
+                        val = val.strip()
+                        if "github.com" in val.lower():
+                            return val
+    return None
+
 def parse_batch_year(batch_str: str) -> int:
     if not batch_str:
         return 0
@@ -88,6 +122,7 @@ def parse_batch_year(batch_str: str) -> int:
         if token.isdigit() and len(token) == 4:
             return int(token)
     return 0
+
 
 # Endpoint 2: GET /api/discover-startups
 @app.get("/api/discover-startups")
@@ -151,6 +186,7 @@ async def discover_startups():
         # Build direct-to-careers url or fall back to YC WorkAtAStartup
         jobs_url = f"{website.rstrip('/')}/careers" if website else "https://www.ycombinator.com/jobs/role/"
         contact_location = c.get("all_locations") or "Remote / San Francisco"
+        github_url = extract_github_url(c)
         
         results.append({
             "name": name,
@@ -159,6 +195,7 @@ async def discover_startups():
             "website": website,
             "jobs_url": jobs_url,
             "contact_location": contact_location,
+            "github_url": github_url,
             "AI_summary": summaries[i]
         })
         
