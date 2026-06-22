@@ -8,7 +8,23 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 from google import genai
+from google.genai import types
 from dotenv import load_dotenv
+from pydantic import BaseModel
+
+class NewsRequest(BaseModel):
+    title: str
+    url: str
+
+def extract_text_from_html(html_content: str) -> str:
+    # Remove script and style elements
+    html_content = re.sub(r'<(script|style)[^>]*>([\s\S]*?)<\/\1>', ' ', html_content, flags=re.IGNORECASE)
+    # Strip HTML tags
+    text = re.sub(r'<[^>]+>', ' ', html_content)
+    # Clean up whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text[:2000]
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -289,6 +305,62 @@ async def discover_startups(country: str = "All"):
         
     logger.info(f"Successfully processed and generated summaries for {len(results)} startups")
     return results
+
+# Endpoint 3: POST /api/summarize-news
+@app.post("/api/summarize-news")
+async def summarize_news(request: NewsRequest):
+    logger.info(f"Summarizing news article: {request.title} (URL: {request.url})")
+    
+    html_text = ""
+    # Try fetching the URL content
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        res = requests.get(request.url, headers=headers, timeout=8)
+        res.raise_for_status()
+        html_text = extract_text_from_html(res.text)
+    except Exception as e:
+        logger.warning(f"Failed to scrape URL {request.url}: {e}. Falling back to title-based summarization.")
+
+    # Call Gemini model
+    client = get_genai_client()
+    
+    # Prompt construction
+    if html_text:
+        prompt = (
+            f"Article Title: {request.title}\n"
+            f"Extracted Content: {html_text}\n"
+        )
+    else:
+        prompt = (
+            f"Article Title: {request.title}\n"
+            "Scraping was blocked. Please summarize this article using its title and your internal knowledge."
+        )
+
+    system_instruction = (
+        "You are an automated terminal system. Provide a strict, highly technical "
+        "2-sentence summary of this news article. Do not use conversational filler. "
+        "Output the response in plain text."
+    )
+    
+    try:
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model="gemini-3.1-flash-lite",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction
+            )
+        )
+        summary = response.text.strip() if response.text else "No summary available."
+        return {"summary": summary}
+    except Exception as e:
+        logger.error(f"Gemini API error during news summarization: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate summary: {e}"
+        )
 
 if __name__ == "__main__":
     import uvicorn
