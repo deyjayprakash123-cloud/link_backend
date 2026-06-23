@@ -362,7 +362,202 @@ async def summarize_news(request: NewsRequest):
             detail=f"Failed to generate summary: {e}"
         )
 
+def interleave_lists(lists: List[List[Any]]) -> List[Any]:
+    interleaved = []
+    max_len = max(len(l) for l in lists) if lists else 0
+    for i in range(max_len):
+        for l in lists:
+            if i < len(l):
+                interleaved.append(l[i])
+    return interleaved
+
+async def fetch_yc_companies() -> List[Dict[str, Any]]:
+    url = "https://yc-oss.github.io/api/companies/all.json"
+    try:
+        logger.info("Fetching YC companies for radar...")
+        res = await asyncio.to_thread(requests.get, url, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        if not isinstance(data, list):
+            logger.warning("YC Open Source did not return a list")
+            return []
+        
+        results = []
+        for c in data:
+            if c.get("status") == "Active":
+                results.append({
+                    "name": c.get("name") or "Unknown Company",
+                    "origin_platform": "YC Open Source",
+                    "hq_location": c.get("all_locations") or "Remote / San Francisco",
+                    "target_link": c.get("website") or c.get("url") or "",
+                    "raw_description": c.get("long_description") or c.get("one_liner") or ""
+                })
+        return results
+    except Exception as e:
+        logger.error(f"Error fetching YC companies: {e}")
+        return []
+
+async def fetch_arbeitnow_jobs() -> List[Dict[str, Any]]:
+    url = "https://www.arbeitnow.com/api/job-board-api"
+    try:
+        logger.info("Fetching Arbeitnow jobs for radar...")
+        res = await asyncio.to_thread(requests.get, url, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        jobs = data.get("data", []) if isinstance(data, dict) else []
+        
+        results = []
+        for item in jobs:
+            title = item.get("title") or ""
+            desc = extract_text_from_html(item.get("description") or "")
+            raw_desc = f"{title}. {desc}" if desc else title
+            results.append({
+                "name": item.get("company_name") or "Unknown Company",
+                "origin_platform": "Global Job Engine",
+                "hq_location": item.get("location") or "Remote",
+                "target_link": item.get("url") or "",
+                "raw_description": raw_desc
+            })
+        return results
+    except Exception as e:
+        logger.error(f"Error fetching Arbeitnow jobs: {e}")
+        return []
+
+async def fetch_remoteok_jobs() -> List[Dict[str, Any]]:
+    url = "https://remoteok.com/api"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    try:
+        logger.info("Fetching RemoteOK jobs for radar...")
+        res = await asyncio.to_thread(requests.get, url, headers=headers, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        if not isinstance(data, list):
+            logger.warning("RemoteOK API did not return a list")
+            return []
+        
+        results = []
+        # RemoteOK first item is metadata, skip it
+        for item in data[1:]:
+            if not isinstance(item, dict):
+                continue
+            position = item.get("position") or ""
+            desc = extract_text_from_html(item.get("description") or "")
+            raw_desc = f"{position}. {desc}" if desc else position
+            results.append({
+                "name": item.get("company") or "Unknown Company",
+                "origin_platform": "Remote Ecosystem",
+                "hq_location": item.get("location") or "Remote",
+                "target_link": item.get("url") or "",
+                "raw_description": raw_desc
+            })
+        return results
+    except Exception as e:
+        logger.error(f"Error fetching RemoteOK jobs: {e}")
+        return []
+
+async def generate_radar_diagnostic(client: genai.Client, company: Dict[str, Any]) -> str:
+    name = company.get("name", "Unknown Company")
+    platform = company.get("origin_platform", "Unknown")
+    description = company.get("raw_description", "")
+    
+    prompt = (
+        f"Company Name: {name}\n"
+        f"Platform: {platform}\n"
+        f"Description:\n{description}\n"
+    )
+    
+    system_instruction = (
+        "You are an integrated terminal analyzer. Read the provided company description. "
+        "Output a strict 2-sentence technical diagnostic outlining: "
+        "1) Their infrastructure/product niche, and "
+        "2) The exact developer stack or skill set that aligns with their engineering needs. "
+        "No conversational filler."
+    )
+    
+    try:
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model="gemini-3.1-flash-lite",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction
+            )
+        )
+        return response.text.strip() if response.text else "Diagnostic unavailable."
+    except Exception as e:
+        logger.error(f"Gemini API error for global-radar entity {name}: {e}")
+        return "Diagnostic unavailable due to API error."
+
+@app.get("/api/global-radar")
+async def global_radar(source: str = "ALL"):
+    logger.info(f"Global Tech Radar query triggered with source: {source}")
+    
+    source_upper = source.upper().strip()
+    fetch_yc = False
+    fetch_job = False
+    fetch_remote = False
+    
+    if source_upper == "ALL":
+        fetch_yc = True
+        fetch_job = True
+        fetch_remote = True
+    elif "YC" in source_upper:
+        fetch_yc = True
+    elif "JOB" in source_upper or "ARBEIT" in source_upper:
+        fetch_job = True
+    elif "REMOTE" in source_upper:
+        fetch_remote = True
+    else:
+        # Fallback to ALL
+        fetch_yc = True
+        fetch_job = True
+        fetch_remote = True
+        
+    tasks = []
+    if fetch_yc:
+        tasks.append(fetch_yc_companies())
+    if fetch_job:
+        tasks.append(fetch_arbeitnow_jobs())
+    if fetch_remote:
+        tasks.append(fetch_remoteok_jobs())
+        
+    stream_results = await asyncio.gather(*tasks)
+    
+    valid_lists = [lst for lst in stream_results if lst]
+    
+    if not valid_lists:
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to retrieve data from any of the requested data sources."
+        )
+        
+    combined = interleave_lists(valid_lists)
+    
+    # Slice the first 5 for Gemini telemetry processing
+    batch_size = min(5, len(combined))
+    batch_to_process = combined[:batch_size]
+    
+    # Initialize GenAI Client
+    client = get_genai_client()
+    
+    logger.info(f"Processing Gemini telemetry diagnostic for a batch of {batch_size} companies...")
+    telemetry_tasks = [generate_radar_diagnostic(client, comp) for comp in batch_to_process]
+    diagnostics = await asyncio.gather(*telemetry_tasks)
+    
+    # Add telemetry_diagnostic field
+    for i, item in enumerate(combined):
+        if i < batch_size:
+            item["telemetry_diagnostic"] = diagnostics[i]
+        else:
+            item["telemetry_diagnostic"] = None
+            
+    logger.info(f"Global Tech Radar returned {len(combined)} items.")
+    return combined
+
 if __name__ == "__main__":
     import uvicorn
     # Start app locally on port 8000
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
