@@ -385,12 +385,16 @@ async def fetch_yc_companies() -> List[Dict[str, Any]]:
         results = []
         for c in data:
             if c.get("status") == "Active":
+                loc = c.get("all_locations") or c.get("location") or "Remote/Global"
+                desc = c.get("long_description") or c.get("one_liner") or ""
+                url_val = c.get("website") or c.get("url") or ""
                 results.append({
                     "name": c.get("name") or "Unknown Company",
-                    "origin_platform": "YC Open Source",
-                    "hq_location": c.get("all_locations") or "Remote / San Francisco",
-                    "target_link": c.get("website") or c.get("url") or "",
-                    "raw_description": c.get("long_description") or c.get("one_liner") or ""
+                    "platform": "YC Open Source",
+                    "location": loc,
+                    "url": url_val,
+                    "description": desc,
+                    "batch": c.get("batch") or "Unknown Batch"
                 })
         return results
     except Exception as e:
@@ -411,50 +415,62 @@ async def fetch_arbeitnow_jobs() -> List[Dict[str, Any]]:
             title = item.get("title") or ""
             desc = extract_text_from_html(item.get("description") or "")
             raw_desc = f"{title}. {desc}" if desc else title
+            loc = item.get("location") or "Remote/Global"
+            url_val = item.get("url") or ""
             results.append({
                 "name": item.get("company_name") or "Unknown Company",
-                "origin_platform": "Global Job Engine",
-                "hq_location": item.get("location") or "Remote",
-                "target_link": item.get("url") or "",
-                "raw_description": raw_desc
+                "platform": "Global Job Engine",
+                "location": loc,
+                "url": url_val,
+                "description": raw_desc
             })
         return results
     except Exception as e:
         logger.error(f"Error fetching Arbeitnow jobs: {e}")
         return []
 
-async def fetch_remoteok_jobs() -> List[Dict[str, Any]]:
-    url = "https://remoteok.com/api"
+async def fetch_github_trending() -> List[Dict[str, Any]]:
+    url = "https://github.com/trending"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     try:
-        logger.info("Fetching RemoteOK jobs for radar...")
+        logger.info("Fetching GitHub Trending repositories...")
         res = await asyncio.to_thread(requests.get, url, headers=headers, timeout=10)
         res.raise_for_status()
-        data = res.json()
-        if not isinstance(data, list):
-            logger.warning("RemoteOK API did not return a list")
-            return []
+        
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(res.text, "html.parser")
+        articles = soup.find_all("article", class_="Box-row")
         
         results = []
-        # RemoteOK first item is metadata, skip it
-        for item in data[1:]:
-            if not isinstance(item, dict):
+        for a in articles:
+            h2 = a.find("h2")
+            if not h2:
                 continue
-            position = item.get("position") or ""
-            desc = extract_text_from_html(item.get("description") or "")
-            raw_desc = f"{position}. {desc}" if desc else position
+            anchor = h2.find("a")
+            if not anchor:
+                continue
+            
+            href = anchor.get("href", "")
+            repo_path = href.strip("/")
+            repo_url = f"https://github.com/{repo_path}"
+            
+            name_text = anchor.get_text(strip=True).replace("\n", "").replace(" ", "")
+            
+            desc_p = a.find("p", class_=lambda c: c and "col-9" in c)
+            description = desc_p.get_text(strip=True) if desc_p else ""
+            
             results.append({
-                "name": item.get("company") or "Unknown Company",
-                "origin_platform": "Remote Ecosystem",
-                "hq_location": item.get("location") or "Remote",
-                "target_link": item.get("url") or "",
-                "raw_description": raw_desc
+                "name": name_text,
+                "platform": "GitHub Trending",
+                "location": "Remote/Global",
+                "url": repo_url,
+                "description": description
             })
         return results
     except Exception as e:
-        logger.error(f"Error fetching RemoteOK jobs: {e}")
+        logger.error(f"Error fetching GitHub Trending: {e}")
         return []
 
 async def generate_radar_diagnostic(client: genai.Client | None, company: Dict[str, Any]) -> str:
@@ -462,8 +478,8 @@ async def generate_radar_diagnostic(client: genai.Client | None, company: Dict[s
         return "> ERROR: TELEMETRY_UNAVAILABLE"
         
     name = company.get("name", "Unknown Company")
-    platform = company.get("origin_platform", "Unknown")
-    description = company.get("raw_description", "")
+    platform = company.get("platform", "Unknown")
+    description = company.get("description", "")
     
     prompt = (
         f"Company Name: {name}\n"
@@ -494,39 +510,15 @@ async def generate_radar_diagnostic(client: genai.Client | None, company: Dict[s
         return "> ERROR: TELEMETRY_UNAVAILABLE"
 
 @app.get("/api/global-radar")
-async def global_radar(source: str = "ALL", limit: int = 5):
-    logger.info(f"Global Tech Radar query triggered with source: {source}, limit: {limit}")
+async def global_radar(country: str = "All", limit: int = 5, source: str = "ALL"):
+    logger.info(f"Global Tech Radar query triggered with country: {country}, limit: {limit}, source: {source}")
     
-    source_upper = source.upper().strip()
-    fetch_yc = False
-    fetch_job = False
-    fetch_remote = False
-    
-    if source_upper == "ALL":
-        fetch_yc = True
-        fetch_job = True
-        fetch_remote = True
-    elif "YC" in source_upper:
-        fetch_yc = True
-    elif "JOB" in source_upper or "ARBEIT" in source_upper:
-        fetch_job = True
-    elif "REMOTE" in source_upper:
-        fetch_remote = True
-    else:
-        # Fallback to ALL
-        fetch_yc = True
-        fetch_job = True
-        fetch_remote = True
-        
-    tasks = []
-    if fetch_yc:
-        tasks.append(fetch_yc_companies())
-    if fetch_job:
-        tasks.append(fetch_arbeitnow_jobs())
-    if fetch_remote:
-        tasks.append(fetch_remoteok_jobs())
-        
-    stream_results = await asyncio.gather(*tasks)
+    # Fetch concurrently from YC, Arbeitnow, and GitHub Trending
+    stream_results = await asyncio.gather(
+        fetch_yc_companies(),
+        fetch_arbeitnow_jobs(),
+        fetch_github_trending()
+    )
     
     valid_lists = [lst for lst in stream_results if lst]
     
@@ -538,7 +530,12 @@ async def global_radar(source: str = "ALL", limit: int = 5):
         
     combined = interleave_lists(valid_lists)
     
-    # Slice the combined list to the requested limit parameter first
+    # Strict Regional Filtering: case-insensitive filter
+    if country and country.lower() != "all":
+        country_lower = country.lower().strip()
+        combined = [item for item in combined if country_lower in item.get("location", "").lower()]
+        
+    # Safe Slicing: Slice only AFTER the regional filter has been applied
     combined = combined[:limit]
     
     # Initialize GenAI Client safely
@@ -548,13 +545,24 @@ async def global_radar(source: str = "ALL", limit: int = 5):
         logger.error(f"Failed to initialize GenAI Client for global-radar telemetry: {e}")
         client = None
     
+    # Loop through the safely sliced list to generate the 2-sentence summaries
     logger.info(f"Processing Gemini telemetry diagnostic for a batch of {len(combined)} companies...")
     telemetry_tasks = [generate_radar_diagnostic(client, comp) for comp in combined]
     diagnostics = await asyncio.gather(*telemetry_tasks)
     
-    # Add telemetry_diagnostic field to all items in the sliced list
+    # Add telemetry_diagnostic and frontend aliases
     for i, item in enumerate(combined):
-        item["telemetry_diagnostic"] = diagnostics[i]
+        diag = diagnostics[i]
+        item["telemetry_diagnostic"] = diag
+        item["AI_summary"] = diag
+        item["origin_platform"] = item["platform"]
+        item["hq_location"] = item["location"]
+        item["contact_location"] = item["location"]
+        item["target_link"] = item["url"]
+        item["jobs_url"] = item["url"]
+        item["raw_description"] = item["description"]
+        if "batch" not in item:
+            item["batch"] = "Global"
             
     logger.info(f"Global Tech Radar returned {len(combined)} items.")
     return combined
