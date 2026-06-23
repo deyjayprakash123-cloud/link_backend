@@ -457,7 +457,10 @@ async def fetch_remoteok_jobs() -> List[Dict[str, Any]]:
         logger.error(f"Error fetching RemoteOK jobs: {e}")
         return []
 
-async def generate_radar_diagnostic(client: genai.Client, company: Dict[str, Any]) -> str:
+async def generate_radar_diagnostic(client: genai.Client | None, company: Dict[str, Any]) -> str:
+    if not client:
+        return "> ERROR: TELEMETRY_UNAVAILABLE"
+        
     name = company.get("name", "Unknown Company")
     platform = company.get("origin_platform", "Unknown")
     description = company.get("raw_description", "")
@@ -485,14 +488,14 @@ async def generate_radar_diagnostic(client: genai.Client, company: Dict[str, Any
                 system_instruction=system_instruction
             )
         )
-        return response.text.strip() if response.text else "Diagnostic unavailable."
+        return response.text.strip() if response.text else "> ERROR: TELEMETRY_UNAVAILABLE"
     except Exception as e:
         logger.error(f"Gemini API error for global-radar entity {name}: {e}")
-        return "Diagnostic unavailable due to API error."
+        return "> ERROR: TELEMETRY_UNAVAILABLE"
 
 @app.get("/api/global-radar")
-async def global_radar(source: str = "ALL"):
-    logger.info(f"Global Tech Radar query triggered with source: {source}")
+async def global_radar(source: str = "ALL", limit: int = 5):
+    logger.info(f"Global Tech Radar query triggered with source: {source}, limit: {limit}")
     
     source_upper = source.upper().strip()
     fetch_yc = False
@@ -535,23 +538,23 @@ async def global_radar(source: str = "ALL"):
         
     combined = interleave_lists(valid_lists)
     
-    # Slice the first 5 for Gemini telemetry processing
-    batch_size = min(5, len(combined))
-    batch_to_process = combined[:batch_size]
+    # Slice the combined list to the requested limit parameter first
+    combined = combined[:limit]
     
-    # Initialize GenAI Client
-    client = get_genai_client()
+    # Initialize GenAI Client safely
+    try:
+        client = get_genai_client()
+    except Exception as e:
+        logger.error(f"Failed to initialize GenAI Client for global-radar telemetry: {e}")
+        client = None
     
-    logger.info(f"Processing Gemini telemetry diagnostic for a batch of {batch_size} companies...")
-    telemetry_tasks = [generate_radar_diagnostic(client, comp) for comp in batch_to_process]
+    logger.info(f"Processing Gemini telemetry diagnostic for a batch of {len(combined)} companies...")
+    telemetry_tasks = [generate_radar_diagnostic(client, comp) for comp in combined]
     diagnostics = await asyncio.gather(*telemetry_tasks)
     
-    # Add telemetry_diagnostic field
+    # Add telemetry_diagnostic field to all items in the sliced list
     for i, item in enumerate(combined):
-        if i < batch_size:
-            item["telemetry_diagnostic"] = diagnostics[i]
-        else:
-            item["telemetry_diagnostic"] = None
+        item["telemetry_diagnostic"] = diagnostics[i]
             
     logger.info(f"Global Tech Radar returned {len(combined)} items.")
     return combined
