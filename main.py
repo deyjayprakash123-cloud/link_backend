@@ -568,9 +568,118 @@ async def global_radar(country: str = "All", limit: int = 5, source: str = "ALL"
     logger.info(f"Global Tech Radar returned {len(combined)} items.")
     return combined
 
+async def generate_blueprint_card(
+    client: genai.Client | None,
+    user_stack: List[str],
+    repo_map: Dict[str, List[str]],
+    deep_dependencies: List[str],
+    startup: Dict[str, Any]
+) -> Dict[str, Any]:
+    startup_name = startup.get("name", "Unknown")
+    startup_desc = startup.get("description") or startup.get("raw_description") or ""
+    
+    # Fallback Offline Heuristic Matcher
+    def get_fallback():
+        desc = startup_desc.lower()
+        matching = []
+        missing = []
+        proof_repos = []
+        
+        for lang in user_stack:
+            if lang.lower() in desc:
+                matching.append(lang)
+                proof_repos.extend(repo_map.get(lang, []))
+            else:
+                missing.append(lang)
+                
+        if not user_stack:
+            missing = ["Python", "JavaScript"]
+            
+        match_percentage = int((len(matching) / max(len(user_stack), 1)) * 100)
+        if not user_stack:
+            match_percentage = 0
+            
+        inf_depth = "No advanced dependencies detected in target startup description."
+        known_frameworks = ["react", "next.js", "vue", "angular", "django", "flask", "fastapi", "spring", "rails", "kubernetes", "docker", "aws", "postgresql", "mongodb", "three.js", "tailwindcss"]
+        found_fws = []
+        for fw in known_frameworks:
+            if fw in desc:
+                found_fws.append(fw.title())
+        if found_fws:
+            inf_depth = f"Target startup utilizes {', '.join(found_fws)} in their infrastructure stack."
+            
+        return {
+            "startup_name": startup_name,
+            "startup_description": startup_desc,
+            "match_percentage": match_percentage,
+            "matching_skills": matching,
+            "missing_skills": missing,
+            "proof_repos": list(set(proof_repos)),
+            "infrastructure_depth": inf_depth,
+            "diagnostic_log": f"Offline diagnostic profile completed for {startup_name} using raw developer stack heuristics."
+        }
+
+    if not client:
+        return get_fallback()
+        
+    prompt = f"""
+[SOURCE VARIABLE: USER REPOSITORIES AND ALL EXTRACTED CONFIG DEPENDENCIES]
+User Tech Stack: {json.dumps(user_stack)}
+User Repo Map (maps language to repository names): {json.dumps(repo_map)}
+User Deep Dependencies (frameworks extracted from package.json/requirements.txt): {json.dumps(deep_dependencies)}
+
+[TARGET VARIABLE: STARTUP DATA RECRUITMENT NODES]
+- Company Name: {startup_name}
+- Company Target Specs / Job Description: {startup_desc}
+
+OPERATIONAL INSTRUCTIONS:
+- Calculate an objective 'match_percentage' (0 to 100) based on actual tech-stack convergence. Do not default to 0% if similarities exist.
+- For 'infrastructure_depth', read the TARGET STARTUP's description and determine their tech framework. Do NOT copy the user's config dependencies into this field.
+"""
+
+    system_instruction = (
+        "You are a deterministic technical matching parser. Compare the user's tech stack against the target startup. "
+        "Output a RAW JSON object with exactly these keys: "
+        "\"startup_name\" (string), "
+        "\"match_percentage\" (integer 0-100), "
+        "\"matching_skills\" (array of strings), "
+        "\"missing_skills\" (array of strings), "
+        "\"proof_repos\" (array of strings containing the exact repository names that prove the matching skills), "
+        "\"infrastructure_depth\" (a 1-sentence string where you explicitly call out the advanced frameworks/packages you detected in the target startup description), "
+        "\"diagnostic_log\" (1-sentence string)."
+    )
+
+    try:
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model="gemini-3.1-flash-lite",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                response_mime_type="application/json"
+            )
+        )
+        response_text = response.text.strip() if response.text else "{}"
+        try:
+            blueprint_card = json.loads(response_text)
+            required_keys = {"startup_name", "match_percentage", "matching_skills", "missing_skills", "proof_repos", "infrastructure_depth", "diagnostic_log"}
+            if isinstance(blueprint_card, dict) and required_keys.issubset(blueprint_card.keys()):
+                blueprint_card["match_percentage"] = int(blueprint_card["match_percentage"])
+                blueprint_card["startup_description"] = startup_desc
+                return blueprint_card
+            else:
+                logger.warning(f"Gemini response missing keys or not dict for {startup_name}, falling back to heuristic. Response: {response_text}")
+                return get_fallback()
+        except Exception as e:
+            logger.error(f"Error parsing Gemini blueprint response JSON for {startup_name}: {e}. Raw response: {response_text}")
+            return get_fallback()
+    except Exception as e:
+        logger.error(f"Gemini API error during blueprint card generation for {startup_name}: {e}")
+        return get_fallback()
+
 @app.get("/api/blueprint")
-async def get_blueprint(github_username: str):
-    logger.info(f"Skill-Gap Blueprint triggered for GitHub user: {github_username}")
+async def get_blueprint(github_username: str, limit: int = 5):
+    logger.info(f"Skill-Gap Blueprint triggered for GitHub user: {github_username} (limit: {limit})")
     try:
         # 1. Fetch GitHub profile repos
         github_token = os.getenv("GITHUB_TOKEN")
@@ -665,7 +774,7 @@ async def get_blueprint(github_username: str):
         deep_dependencies_list = list(deep_dependencies)
         logger.info(f"Aggregated deep dependencies: {deep_dependencies_list}")
 
-        # 3. Sourcing 5 startups using global fetch logic
+        # 3. Sourcing startups using global fetch logic
         stream_results = await asyncio.gather(
             fetch_yc_companies(),
             fetch_arbeitnow_jobs()
@@ -674,9 +783,19 @@ async def get_blueprint(github_username: str):
         if not valid_lists:
             return {"error": "Failed to retrieve startup data from any of the data sources."}
         combined = interleave_lists(valid_lists)
-        startups = combined[:5]
+        
+        # Filter combined array to only include objects with valid, non-null names and descriptions
+        valid_pool = [
+            item for item in combined
+            if item.get("name") and (item.get("description") or item.get("raw_description"))
+        ]
+        
+        if not valid_pool:
+            return {"error": "No valid startups with descriptions found."}
+            
+        startups = random.sample(valid_pool, min(len(valid_pool), limit))
 
-        # Format startups for prompt
+        # Format startups
         formatted_startups = []
         for s in startups:
             formatted_startups.append({
@@ -691,85 +810,13 @@ async def get_blueprint(github_username: str):
         except Exception as e:
             logger.warning(f"Google GenAI Client initialization failed, falling back to offline diagnostic: {e}")
 
-        if client:
-            prompt = (
-                f"User Tech Stack: {json.dumps(user_stack)}\n"
-                f"User Repo Map (maps language to repository names): {json.dumps(repo_map)}\n"
-                f"User Deep Dependencies (frameworks extracted from package.json/requirements.txt): {json.dumps(deep_dependencies_list)}\n\n"
-                f"Startups to compare against:\n{json.dumps(formatted_startups, indent=2)}"
-            )
-
-            system_instruction = (
-                "You are a strict diagnostic system. Compare the user's tech stack against these startups. "
-                "You have access to their `repo_map` and their `deep_dependencies` list of frameworks. "
-                "Output a RAW JSON array of objects with exactly these keys: "
-                "\"startup_name\" (string), "
-                "\"match_percentage\" (integer 0-100), "
-                "\"matching_skills\" (array of strings), "
-                "\"missing_skills\" (array of strings), "
-                "\"proof_repos\" (array of strings containing the exact repository names that prove the matching skills), "
-                "\"infrastructure_depth\" (a 1-sentence string where you explicitly call out the advanced frameworks/packages you detected, "
-                "e.g., 'Advanced usage of Next.js and Three.js detected in package.json.'), and "
-                "\"diagnostic_log\" (1-sentence string)."
-            )
-
-            try:
-                response = await asyncio.to_thread(
-                    client.models.generate_content,
-                    model="gemini-3.1-flash-lite",
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                        response_mime_type="application/json"
-                    )
-                )
-                response_text = response.text.strip() if response.text else "[]"
-                try:
-                    blueprint_data = json.loads(response_text)
-                    return blueprint_data
-                except Exception as e:
-                    logger.error(f"Error parsing Gemini blueprint response JSON: {e}. Raw response: {response_text}")
-            except Exception as e:
-                logger.error(f"Gemini API error during blueprint diagnosis: {e}")
-
-        # Fallback Offline Heuristic Matcher
-        logger.info("Generating offline heuristic blueprint match...")
-        blueprint = []
-        for s in startups:
-            name = s.get("name", "Unknown")
-            desc = (s.get("description") or s.get("raw_description") or "").lower()
-            
-            matching = []
-            missing = []
-            proof_repos = []
-            
-            for lang in user_stack:
-                if lang.lower() in desc:
-                    matching.append(lang)
-                    proof_repos.extend(repo_map.get(lang, []))
-                else:
-                    missing.append(lang)
-                    
-            if not user_stack:
-                missing = ["Python", "JavaScript"]
-                
-            match_percentage = int((len(matching) / max(len(user_stack), 1)) * 100)
-            if not user_stack:
-                match_percentage = 0
-                
-            inf_depth = "No advanced dependencies detected in repository config files."
-            if deep_dependencies_list:
-                inf_depth = f"Detected usage of key frameworks/packages: {', '.join(deep_dependencies_list[:4])}."
-
-            blueprint.append({
-                "startup_name": name,
-                "match_percentage": match_percentage,
-                "matching_skills": matching,
-                "missing_skills": missing,
-                "proof_repos": list(set(proof_repos)),
-                "infrastructure_depth": inf_depth,
-                "diagnostic_log": f"Offline diagnostic profile completed for {name} using raw developer stack heuristics."
-            })
+        # Execute parallel generation calls for each selected startup
+        logger.info(f"Generating blueprint cards for {len(formatted_startups)} startups...")
+        tasks = [
+            generate_blueprint_card(client, user_stack, repo_map, deep_dependencies_list, startup)
+            for startup in formatted_startups
+        ]
+        blueprint = await asyncio.gather(*tasks)
         return blueprint
 
     except Exception as e:
