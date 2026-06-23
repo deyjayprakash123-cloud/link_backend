@@ -603,6 +603,68 @@ async def get_blueprint(github_username: str):
         user_stack = list(languages)
         logger.info(f"Extracted user tech stack: {user_stack}, repo_map: {repo_map}")
 
+        # Deep Scan Loop for top 3 most recently updated repos
+        top_repos = repos[:3] if isinstance(repos, list) else []
+        deep_dependencies = set()
+
+        async def fetch_raw_contents(repo_name, filename):
+            url = f"https://api.github.com/repos/{github_username}/{repo_name}/contents/{filename}"
+            raw_headers = {
+                "Accept": "application/vnd.github.v3.raw",
+                "User-Agent": "Global-Radar-App"
+            }
+            if github_token:
+                raw_headers["Authorization"] = f"token {github_token}"
+            try:
+                res = await asyncio.to_thread(requests.get, url, headers=raw_headers, timeout=5)
+                if res.status_code == 200:
+                    return res.text
+            except Exception as e:
+                logger.error(f"Error fetching {filename} for {repo_name}: {e}")
+            return None
+
+        scan_tasks = []
+        for r in top_repos:
+            r_name = r.get("name")
+            if r_name and isinstance(r_name, str):
+                scan_tasks.append((r_name, "package.json"))
+                scan_tasks.append((r_name, "requirements.txt"))
+
+        if scan_tasks:
+            contents = await asyncio.gather(*(fetch_raw_contents(r_name, fname) for r_name, fname in scan_tasks))
+            for (r_name, fname), content in zip(scan_tasks, contents):
+                if not content:
+                    continue
+                if fname == "package.json":
+                    try:
+                        data = json.loads(content)
+                        if isinstance(data, dict):
+                            deps = data.get("dependencies", {})
+                            dev_deps = data.get("devDependencies", {})
+                            if isinstance(deps, dict):
+                                for k in deps.keys():
+                                    deep_dependencies.add(k)
+                            if isinstance(dev_deps, dict):
+                                for k in dev_deps.keys():
+                                    deep_dependencies.add(k)
+                    except Exception as ex:
+                        logger.warning(f"Error parsing package.json for {r_name}: {ex}")
+                elif fname == "requirements.txt":
+                    try:
+                        for line in content.splitlines():
+                            line = line.strip()
+                            if not line or line.startswith("#"):
+                                continue
+                            parts = re.split(r'==|>=|<=|~=|>|<', line)
+                            pkg_name = parts[0].strip()
+                            if pkg_name:
+                                deep_dependencies.add(pkg_name)
+                    except Exception as ex:
+                        logger.warning(f"Error parsing requirements.txt for {r_name}: {ex}")
+
+        deep_dependencies_list = list(deep_dependencies)
+        logger.info(f"Aggregated deep dependencies: {deep_dependencies_list}")
+
         # 3. Sourcing 5 startups using global fetch logic
         stream_results = await asyncio.gather(
             fetch_yc_companies(),
@@ -632,18 +694,22 @@ async def get_blueprint(github_username: str):
         if client:
             prompt = (
                 f"User Tech Stack: {json.dumps(user_stack)}\n"
-                f"User Repo Map (maps language to repository names): {json.dumps(repo_map)}\n\n"
+                f"User Repo Map (maps language to repository names): {json.dumps(repo_map)}\n"
+                f"User Deep Dependencies (frameworks extracted from package.json/requirements.txt): {json.dumps(deep_dependencies_list)}\n\n"
                 f"Startups to compare against:\n{json.dumps(formatted_startups, indent=2)}"
             )
 
             system_instruction = (
                 "You are a strict diagnostic system. Compare the user's tech stack against these startups. "
-                "You have access to their `repo_map`. Output a RAW JSON array of objects with exactly these keys: "
+                "You have access to their `repo_map` and their `deep_dependencies` list of frameworks. "
+                "Output a RAW JSON array of objects with exactly these keys: "
                 "\"startup_name\" (string), "
                 "\"match_percentage\" (integer 0-100), "
                 "\"matching_skills\" (array of strings), "
                 "\"missing_skills\" (array of strings), "
-                "\"proof_repos\" (array of strings containing the exact repository names that prove the matching skills), and "
+                "\"proof_repos\" (array of strings containing the exact repository names that prove the matching skills), "
+                "\"infrastructure_depth\" (a 1-sentence string where you explicitly call out the advanced frameworks/packages you detected, "
+                "e.g., 'Advanced usage of Next.js and Three.js detected in package.json.'), and "
                 "\"diagnostic_log\" (1-sentence string)."
             )
 
@@ -680,7 +746,6 @@ async def get_blueprint(github_username: str):
             for lang in user_stack:
                 if lang.lower() in desc:
                     matching.append(lang)
-                    # Add all repositories for this language to proof_repos
                     proof_repos.extend(repo_map.get(lang, []))
                 else:
                     missing.append(lang)
@@ -692,12 +757,17 @@ async def get_blueprint(github_username: str):
             if not user_stack:
                 match_percentage = 0
                 
+            inf_depth = "No advanced dependencies detected in repository config files."
+            if deep_dependencies_list:
+                inf_depth = f"Detected usage of key frameworks/packages: {', '.join(deep_dependencies_list[:4])}."
+
             blueprint.append({
                 "startup_name": name,
                 "match_percentage": match_percentage,
                 "matching_skills": matching,
                 "missing_skills": missing,
                 "proof_repos": list(set(proof_repos)),
+                "infrastructure_depth": inf_depth,
                 "diagnostic_log": f"Offline diagnostic profile completed for {name} using raw developer stack heuristics."
             })
         return blueprint
