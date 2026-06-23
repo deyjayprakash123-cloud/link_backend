@@ -3,6 +3,7 @@ import random
 import logging
 import asyncio
 import re
+import json
 from typing import List, Dict, Any
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -566,6 +567,133 @@ async def global_radar(country: str = "All", limit: int = 5, source: str = "ALL"
             
     logger.info(f"Global Tech Radar returned {len(combined)} items.")
     return combined
+
+@app.get("/api/blueprint")
+async def get_blueprint(github_username: str):
+    logger.info(f"Skill-Gap Blueprint triggered for GitHub user: {github_username}")
+    
+    # 1. Fetch GitHub profile repos
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        github_url = f"https://api.github.com/users/{github_username}/repos?sort=updated&per_page=10"
+        res = await asyncio.to_thread(requests.get, github_url, headers=headers, timeout=10)
+        if res.status_code == 404:
+            raise HTTPException(status_code=404, detail="GitHub profile not found.")
+        res.raise_for_status()
+        repos = res.json()
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Error fetching GitHub profile for {github_username}: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to retrieve GitHub profile: {str(e)}")
+
+    # 2. Extract unique programming languages
+    languages = set()
+    if isinstance(repos, list):
+        for repo in repos:
+            lang = repo.get("language")
+            if lang and isinstance(lang, str):
+                languages.add(lang)
+    user_stack = list(languages)
+    logger.info(f"Extracted user tech stack: {user_stack}")
+
+    # 3. Sourcing 5 startups using global fetch logic
+    stream_results = await asyncio.gather(
+        fetch_yc_companies(),
+        fetch_arbeitnow_jobs()
+    )
+    valid_lists = [lst for lst in stream_results if lst]
+    if not valid_lists:
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to retrieve startup data from any of the data sources."
+        )
+    combined = interleave_lists(valid_lists)
+    startups = combined[:5]
+
+    # Format startups for prompt
+    formatted_startups = []
+    for s in startups:
+        formatted_startups.append({
+            "name": s.get("name", "Unknown"),
+            "description": s.get("description") or s.get("raw_description") or ""
+        })
+
+    # 4. Matrix comparison processing via Gemini 3.1 Flash-Lite
+    client = None
+    try:
+        client = get_genai_client()
+    except Exception as e:
+        logger.warning(f"Google GenAI Client initialization failed, falling back to offline diagnostic: {e}")
+
+    if client:
+        prompt = (
+            f"User Tech Stack: {json.dumps(user_stack)}\n\n"
+            f"Startups to compare against:\n{json.dumps(formatted_startups, indent=2)}"
+        )
+
+        system_instruction = (
+            "You are a strict diagnostic system. Compare the user's tech stack against these 5 startups. "
+            "Output a RAW JSON array of objects. Do not use markdown blocks. "
+            "Each object must have exactly these keys: "
+            "\"startup_name\" (string), "
+            "\"match_percentage\" (integer 0-100), "
+            "\"matching_skills\" (array of strings), "
+            "\"missing_skills\" (array of strings), and "
+            "\"diagnostic_log\" (1-sentence technical string)."
+        )
+
+        try:
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model="gemini-3.1-flash-lite",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    response_mime_type="application/json"
+                )
+            )
+            response_text = response.text.strip() if response.text else "[]"
+            try:
+                blueprint_data = json.loads(response_text)
+                return blueprint_data
+            except Exception as e:
+                logger.error(f"Error parsing Gemini blueprint response JSON: {e}. Raw response: {response_text}")
+        except Exception as e:
+            logger.error(f"Gemini API error during blueprint diagnosis: {e}")
+
+    # Fallback Offline Heuristic Matcher
+    logger.info("Generating offline heuristic blueprint match...")
+    blueprint = []
+    for s in startups:
+        name = s.get("name", "Unknown")
+        desc = (s.get("description") or s.get("raw_description") or "").lower()
+        
+        matching = []
+        missing = []
+        
+        for lang in user_stack:
+            if lang.lower() in desc:
+                matching.append(lang)
+            else:
+                missing.append(lang)
+                
+        # If user stack is empty, default list
+        if not user_stack:
+            missing = ["Python", "JavaScript"]
+            
+        match_percentage = int((len(matching) / max(len(user_stack), 1)) * 100)
+        if not user_stack:
+            match_percentage = 0
+            
+        blueprint.append({
+            "startup_name": name,
+            "match_percentage": match_percentage,
+            "matching_skills": matching,
+            "missing_skills": missing,
+            "diagnostic_log": f"Offline diagnostic profile completed for {name} using raw developer stack heuristics."
+        })
+    return blueprint
 
 if __name__ == "__main__":
     import uvicorn
