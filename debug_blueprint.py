@@ -23,10 +23,10 @@ async def test_blueprint():
             print(f"\nVerification: Received list of {len(result)} items.")
             if len(result) > 0:
                 first = result[0]
-                required_keys = {"startup_name", "match_percentage", "matching_skills", "missing_skills", "diagnostic_log"}
+                required_keys = {"startup_name", "match_percentage", "matching_skills", "missing_skills", "proof_repos", "diagnostic_log"}
                 keys = set(first.keys())
                 if required_keys.issubset(keys):
-                    print("Verification: All required schema keys are present!")
+                    print("Verification: All required schema keys (including proof_repos) are present!")
                 else:
                     print(f"Verification FAILED: Missing keys. Found {keys}")
         else:
@@ -40,10 +40,15 @@ async def test_blueprint():
     print("\n=== TEST 2: Invalid GitHub Username ===")
     try:
         result = await get_blueprint("invalid_username_12345_xyz_abc_test")
-        print("Unexpected SUCCESS! Response:")
-        print(result)
+        print("Response:")
+        import json
+        print(json.dumps(result, indent=2))
+        if isinstance(result, dict) and "error" in result:
+            print("SUCCESSFUL ERROR HANDLING: Clean JSON error dict returned!")
+        else:
+            print("FAILED: Result is not an error dictionary.")
     except Exception as e:
-        print("SUCCESSFUL ERROR HANDLING: Request failed as expected with exception:")
+        print("FAILED: Test 2 raised an unexpected exception:")
         print(e)
 
 if __name__ == "__main__":
