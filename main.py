@@ -573,7 +573,11 @@ async def get_blueprint(github_username: str):
     logger.info(f"Skill-Gap Blueprint triggered for GitHub user: {github_username}")
     try:
         # 1. Fetch GitHub profile repos
-        headers = {"User-Agent": "Mozilla/5.0"}
+        github_token = os.getenv("GITHUB_TOKEN")
+        headers = {"User-Agent": "Global-Radar-App"}
+        if github_token:
+            headers["Authorization"] = f"token {github_token}"
+            
         github_url = f"https://api.github.com/users/{github_username}/repos?sort=updated&per_page=10"
         res = await asyncio.to_thread(requests.get, github_url, headers=headers, timeout=10)
         if res.status_code == 404:
