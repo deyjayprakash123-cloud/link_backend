@@ -389,13 +389,15 @@ async def fetch_yc_companies() -> List[Dict[str, Any]]:
                 loc = c.get("all_locations") or c.get("location") or "Remote/Global"
                 desc = c.get("long_description") or c.get("one_liner") or ""
                 url_val = c.get("website") or c.get("url") or ""
+                github_url = extract_github_url(c)
                 results.append({
                     "name": c.get("name") or "Unknown Company",
                     "platform": "YC Open Source",
                     "location": loc,
                     "url": url_val,
                     "description": desc,
-                    "batch": c.get("batch") or "Unknown Batch"
+                    "batch": c.get("batch") or "Unknown Batch",
+                    "github_url": github_url
                 })
         return results
     except Exception as e:
@@ -568,13 +570,76 @@ async def global_radar(country: str = "All", limit: int = 5, source: str = "ALL"
     logger.info(f"Global Tech Radar returned {len(combined)} items.")
     return combined
 
+def extract_org_name(github_url: str | None) -> str | None:
+    if not github_url:
+        return None
+    url = github_url.strip().rstrip("/")
+    match = re.search(r"github\.com/([a-zA-Z0-9_\-]+)", url, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return None
+
+async def get_github_org(github_token: str | None, startup_name: str) -> str | None:
+    headers = {"User-Agent": "Global-Radar-App"}
+    if github_token:
+        headers["Authorization"] = f"token {github_token}"
+    clean_name = re.sub(r"[^a-zA-Z0-9\-]", "", startup_name).strip()
+    if not clean_name:
+        return None
+    url = f"https://api.github.com/search/users?q={clean_name}+type:org"
+    try:
+        res = await asyncio.to_thread(requests.get, url, headers=headers, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            items = data.get("items", [])
+            if items:
+                return items[0].get("login")
+    except Exception as e:
+        logger.warning(f"Error searching org for {startup_name}: {e}")
+    return clean_name
+
+async def fetch_startup_issues(org_name: str, github_token: str | None) -> List[Dict[str, Any]]:
+    headers = {
+        "User-Agent": "Global-Radar-App",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    if github_token:
+        headers["Authorization"] = f"token {github_token}"
+    
+    # We search for open issues with label "good first issue" or "help wanted"
+    q_str = f'org:{org_name} state:open (label:"good first issue" OR label:"help wanted")'
+    url = f"https://api.github.com/search/issues?q={requests.utils.quote(q_str)}"
+    try:
+        res = await asyncio.to_thread(requests.get, url, headers=headers, timeout=8)
+        issues = []
+        if res.status_code == 200:
+            issues = res.json().get("items", [])
+        else:
+            # Fallback: try querying label "good first issue" directly
+            q_str_alt = f'org:{org_name} state:open label:"good first issue"'
+            url_alt = f"https://api.github.com/search/issues?q={requests.utils.quote(q_str_alt)}"
+            res_alt = await asyncio.to_thread(requests.get, url_alt, headers=headers, timeout=5)
+            if res_alt.status_code == 200:
+                issues = res_alt.json().get("items", [])
+        
+        results = []
+        for issue in issues[:2]:
+            results.append({
+                "issue_title": issue.get("title", "Open Issue"),
+                "issue_url": issue.get("html_url", ""),
+                "labels": [lbl.get("name") for lbl in issue.get("labels", []) if isinstance(lbl, dict)]
+            })
+        return results
+    except Exception as e:
+        logger.warning(f"Failed to fetch issues for org {org_name}: {e}")
+        return []
+
 async def generate_blueprint_card(
     client: genai.Client | None,
     user_stack: List[str],
     deep_dependencies: List[str],
     startup: Dict[str, Any],
-    file_path: str = "None",
-    raw_source_code: str = "No complex file found."
+    live_issues: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
     startup_name = startup.get("name", "Unknown")
     startup_desc = startup.get("description") or startup.get("raw_description") or ""
@@ -607,6 +672,18 @@ async def generate_blueprint_card(
         if found_fws:
             inf_depth = f"Target startup utilizes {', '.join(found_fws)} in their infrastructure stack."
             
+        # Offline fallback for backdoor_issues
+        backdoor = []
+        for issue in live_issues[:2]:
+            backdoor.append({
+                "title": issue.get("issue_title", "Open Issue"),
+                "url": issue.get("issue_url", "")
+            })
+            
+        action_plan = "Submit a PR to their open-source repository to demonstrate your production coding abilities."
+        if backdoor:
+            action_plan = f"Contribute to their repository by addressing: '{backdoor[0]['title']}'."
+
         return {
             "startup_name": startup_name,
             "startup_description": startup_desc,
@@ -615,10 +692,8 @@ async def generate_blueprint_card(
             "missing_skills": missing,
             "infrastructure_depth": inf_depth,
             "diagnostic_log": f"Offline diagnostic profile completed for {startup_name} using raw developer stack heuristics.",
-            "audited_file": file_path,
-            "code_review_log": "Offline fallback: The file analysis is pending live connection. Make sure that the selected code block is modular, cleanly typed, and follows standard separation of concerns.",
-            "interview_question": f"How would you optimize and scale the system components of this module to handle a 10x spike in daily traffic at {startup_name}?",
-            "recommended_refactor": f"// Recommended Refactor Fallback\n// Maintain strong encapsulation and dependency injection\nexport function optimizeModule(config) {{\n  return {{ ...config, optimized: true }};\n}}"
+            "backdoor_issues": backdoor,
+            "action_plan": action_plan
         }
 
     if not client:
@@ -633,34 +708,28 @@ User Deep Dependencies (frameworks extracted from package.json/requirements.txt)
 - Company Name: {startup_name}
 - Company Target Specs / Job Description: {startup_desc}
 
-[SOURCE VARIABLE: USER CODE FILE AUDIT]
-File Path: {file_path}
-Raw Source Code Content:
-{raw_source_code}
+[SOURCE VARIABLE: LIVE OPEN-SOURCE STARTUP ISSUES]
+Live Issues: {json.dumps(live_issues)}
 
 OPERATIONAL INSTRUCTIONS:
 - Calculate an objective 'match_percentage' (0 to 100) based on actual tech-stack convergence. Do not default to 0% if similarities exist.
 - For 'infrastructure_depth', read the TARGET STARTUP's description and determine their tech framework. Do NOT copy the user's config dependencies into this field.
-- Act as a brutal, highly precise Senior Engineering Manager from the target startup: {startup_name}.
-  Analyze the provided source code file ({file_path}) from the user's repository.
-  Produce the architectural critique (`code_review_log`), interview question (`interview_question`), and refactor suggestion (`recommended_refactor`).
+- Analyze the user's skills (languages and deep_dependencies) and the live open issues.
+  Select the issues that best fit the user's technical stack. Return them in `backdoor_issues`.
+  Produce a punchy 1-sentence `action_plan` instructing the user exactly how this issue connects to their skillset (e.g., "Fix this open TypeScript validation issue to demonstrate your Next.js proficiency directly to their core team.").
 """
 
     system_instruction = (
-        "You are acting as a brutal, highly precise Senior Engineering Manager from the target startup: "
-        f"{startup_name}. Compare the user's tech profile, and analyze this specific source code file ({file_path}) "
-        f"from the user's repository:\n{raw_source_code}\n"
-        "Generate a strict technical JSON response containing these keys:\n"
+        "You are an expert technical matching parser. Compare the user's tech profile against the target startup's live opportunities.\n"
+        "Output a RAW JSON object with exactly these keys:\n"
         "- `startup_name` (string)\n"
         "- `match_percentage` (integer 0-100)\n"
         "- `matching_skills` (array of strings)\n"
         "- `missing_skills` (array of strings)\n"
-        "- `infrastructure_depth` (a 1-sentence string where you explicitly call out the advanced frameworks/packages you detected in the target startup description)\n"
+        "- `infrastructure_depth` (a 1-sentence string detailing the startup's core tech stack detected in their description)\n"
         "- `diagnostic_log` (1-sentence string)\n"
-        "- `audited_file` (string: the name of the file reviewed)\n"
-        "- `code_review_log` (string: a 3-sentence deep architectural critique of this specific file. Point out potential memory leaks, unoptimized loops, typing issues, or scalability constraints)\n"
-        "- `interview_question` (string: the exact technical interview question you would ask them about this specific code block during a live systems design interview)\n"
-        "- `recommended_refactor` (string: a short snippet of how they should rewrite a portion of their file to match production standards)."
+        "- `backdoor_issues` (array of objects, each containing keys: `title` (string) and `url` (string matching issue url))\n"
+        "- `action_plan` (string, a 1-sentence instruction mapping the issue to the user's skillset)."
     )
 
     try:
@@ -676,7 +745,7 @@ OPERATIONAL INSTRUCTIONS:
         response_text = response.text.strip() if response.text else "{}"
         try:
             blueprint_card = json.loads(response_text)
-            required_keys = {"startup_name", "match_percentage", "matching_skills", "missing_skills", "infrastructure_depth", "diagnostic_log", "audited_file", "code_review_log", "interview_question", "recommended_refactor"}
+            required_keys = {"startup_name", "match_percentage", "matching_skills", "missing_skills", "infrastructure_depth", "diagnostic_log", "backdoor_issues", "action_plan"}
             if isinstance(blueprint_card, dict) and required_keys.issubset(blueprint_card.keys()):
                 blueprint_card["match_percentage"] = int(blueprint_card["match_percentage"])
                 blueprint_card["startup_description"] = startup_desc
@@ -943,10 +1012,32 @@ async def get_blueprint(github_username: str, limit: int = 5):
         # Format startups
         formatted_startups = []
         for s in startups:
+            github_url = s.get("github_url")
+            org_name = extract_org_name(github_url)
             formatted_startups.append({
                 "name": s.get("name", "Unknown"),
-                "description": s.get("description") or s.get("raw_description") or ""
+                "description": s.get("description") or s.get("raw_description") or "",
+                "github_url": github_url,
+                "org_name": org_name
             })
+
+        # Resolve org names and fetch live issues in parallel for each startup
+        async def prepare_startup_issues(s):
+            o_name = s.get("org_name")
+            if not o_name:
+                o_name = await get_github_org(github_token, s["name"])
+            
+            issues = []
+            if o_name:
+                issues = await fetch_startup_issues(o_name, github_token)
+            return o_name, issues
+
+        logger.info("Resolving GitHub org names and querying live issues...")
+        org_and_issues = await asyncio.gather(*(prepare_startup_issues(s) for s in formatted_startups))
+
+        for idx, s in enumerate(formatted_startups):
+            s["org_name"] = org_and_issues[idx][0]
+            s["live_issues"] = org_and_issues[idx][1]
 
         # 4. Matrix comparison processing via Gemini 3.1 Flash-Lite
         client = None
@@ -958,7 +1049,7 @@ async def get_blueprint(github_username: str, limit: int = 5):
         # Execute parallel generation calls for each selected startup and viral assets
         logger.info(f"Generating blueprint cards and viral assets...")
         blueprint_tasks = [
-            generate_blueprint_card(client, user_stack, deep_dependencies_list, startup, file_path, raw_source_code)
+            generate_blueprint_card(client, user_stack, deep_dependencies_list, startup, startup.get("live_issues", []))
             for startup in formatted_startups
         ]
         viral_task = generate_viral_assets(client, user_stack, deep_dependencies_list)
