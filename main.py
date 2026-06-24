@@ -677,6 +677,83 @@ OPERATIONAL INSTRUCTIONS:
         logger.error(f"Gemini API error during blueprint card generation for {startup_name}: {e}")
         return get_fallback()
 
+async def generate_viral_assets(
+    client: genai.Client | None,
+    user_stack: List[str],
+    repo_map: Dict[str, List[str]],
+    deep_dependencies: List[str]
+) -> Dict[str, Any]:
+    def get_fallback():
+        langs = ", ".join(user_stack[:3]) if user_stack else "Python, JavaScript"
+        deps_str = ", ".join(deep_dependencies[:5]) if deep_dependencies else "FastAPI, React"
+        profile_md = (
+            "# 💻 Developer Profile\n\n"
+            "```\n"
+            "  ===========================================\n"
+            "  // GLOBAL RADAR TELEMETRY PROFILE //       \n"
+            "  ===========================================\n"
+            "```\n\n"
+            "### 🛠️ Core Tech Stack\n"
+            f"- **Languages:** {langs}\n"
+            f"- **Dependencies/Frameworks:** {deps_str}\n\n"
+            "### 🚀 Startup Focus Fields\n"
+            "- Developer Tools\n"
+            "- AI & Machine Learning\n\n"
+            "<!-- Built with [Global Radar](https://yourdomain.com) -->"
+        )
+        bio = f"Production Engineer specializing in {langs} development and {deps_str} integrations."
+        return {
+            "profile_markdown": profile_md,
+            "headline_bio": bio
+        }
+
+    if not client:
+        return get_fallback()
+
+    prompt = f"""
+[USER DEVELOPER PROFILE DATA]
+- Tech Stack (Languages): {json.dumps(user_stack)}
+- Repositories by Language: {json.dumps(repo_map)}
+- Deep Dependencies (Frameworks/Libraries): {json.dumps(deep_dependencies)}
+
+OPERATIONAL INSTRUCTIONS:
+- Analyze the user's developer profile.
+- Generate a perfectly formatted Markdown block for a GitHub Profile README. It must include terminal-style ascii elements, custom badges highlighting their detected deep dependencies, a breakdown of their top matching startup fields (e.g. AI, Fintech, DevTools, SaaS), and a subtle markdown watermark link back to your site: `<!-- Built with [Global Radar](https://yourdomain.com) -->`.
+- Generate a punchy, 1-sentence bio tagline tailor-made for LinkedIn/X profile taglines based on their production engineering habits (e.g., "Full-Stack Engineer specializing in high-throughput Next.js infrastructure and telemetry systems.").
+"""
+
+    system_instruction = (
+        "You are an expert technical resume/portfolio architect. Analyze the user's tech profile. "
+        "Output a RAW JSON object with exactly these keys:\n"
+        "\"profile_markdown\" (string containing the complete Markdown block),\n"
+        "\"headline_bio\" (string containing the punchy, 1-sentence bio for LinkedIn/X)."
+    )
+
+    try:
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model="gemini-3.1-flash-lite",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                response_mime_type="application/json"
+            )
+        )
+        response_text = response.text.strip() if response.text else "{}"
+        try:
+            assets = json.loads(response_text)
+            if isinstance(assets, dict) and "profile_markdown" in assets and "headline_bio" in assets:
+                return assets
+            else:
+                logger.warning(f"Gemini response missing keys or not dict for viral assets. Response: {response_text}")
+                return get_fallback()
+        except Exception as e:
+            logger.error(f"Error parsing Gemini response JSON for viral assets: {e}. Raw response: {response_text}")
+            return get_fallback()
+    except Exception as e:
+        logger.error(f"Gemini API error during viral assets generation: {e}")
+        return get_fallback()
+
 @app.get("/api/blueprint")
 async def get_blueprint(github_username: str, limit: int = 5):
     logger.info(f"Skill-Gap Blueprint triggered for GitHub user: {github_username} (limit: {limit})")
@@ -810,14 +887,22 @@ async def get_blueprint(github_username: str, limit: int = 5):
         except Exception as e:
             logger.warning(f"Google GenAI Client initialization failed, falling back to offline diagnostic: {e}")
 
-        # Execute parallel generation calls for each selected startup
-        logger.info(f"Generating blueprint cards for {len(formatted_startups)} startups...")
-        tasks = [
+        # Execute parallel generation calls for each selected startup and viral assets
+        logger.info(f"Generating blueprint cards and viral assets...")
+        blueprint_tasks = [
             generate_blueprint_card(client, user_stack, repo_map, deep_dependencies_list, startup)
             for startup in formatted_startups
         ]
-        blueprint = await asyncio.gather(*tasks)
-        return blueprint
+        viral_task = generate_viral_assets(client, user_stack, repo_map, deep_dependencies_list)
+
+        blueprint, viral_assets = await asyncio.gather(
+            asyncio.gather(*blueprint_tasks),
+            viral_task
+        )
+        return {
+            "blueprint": blueprint,
+            "viral_assets": viral_assets
+        }
 
     except Exception as e:
         logger.error(f"High-level error in get_blueprint: {e}")

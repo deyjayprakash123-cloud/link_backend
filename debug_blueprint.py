@@ -19,10 +19,15 @@ async def test_blueprint():
         print(json.dumps(result, indent=2))
         
         # Verify schema
-        if isinstance(result, list):
-            print(f"\nVerification: Received list of {len(result)} items.")
-            if len(result) > 0:
-                first = result[0]
+        if isinstance(result, dict) and "blueprint" in result and "viral_assets" in result:
+            blueprint = result["blueprint"]
+            viral_assets = result["viral_assets"]
+            print(f"\nVerification: Received dict. Blueprint contains {len(blueprint)} items.")
+            print(f"Viral Assets profile_markdown len: {len(viral_assets.get('profile_markdown', ''))}")
+            print(f"Viral Assets headline_bio: {viral_assets.get('headline_bio')}")
+            
+            if len(blueprint) > 0:
+                first = blueprint[0]
                 required_keys = {"startup_name", "match_percentage", "matching_skills", "missing_skills", "proof_repos", "infrastructure_depth", "diagnostic_log"}
                 keys = set(first.keys())
                 if required_keys.issubset(keys):
@@ -30,7 +35,7 @@ async def test_blueprint():
                 else:
                     print(f"Verification FAILED: Missing keys. Found {keys}")
         else:
-            print("Verification FAILED: Result is not a JSON list!")
+            print("Verification FAILED: Result is not a JSON dict with 'blueprint' and 'viral_assets' keys!")
             
     except Exception as e:
         print("ERROR: Test 1 failed with exception:")
