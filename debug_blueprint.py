@@ -28,10 +28,10 @@ async def test_blueprint():
             
             if len(blueprint) > 0:
                 first = blueprint[0]
-                required_keys = {"startup_name", "match_percentage", "matching_skills", "missing_skills", "proof_repos", "infrastructure_depth", "diagnostic_log"}
+                required_keys = {"startup_name", "match_percentage", "matching_skills", "missing_skills", "infrastructure_depth", "diagnostic_log", "audited_file", "code_review_log", "interview_question", "recommended_refactor"}
                 keys = set(first.keys())
                 if required_keys.issubset(keys):
-                    print("Verification: All required schema keys (including proof_repos and infrastructure_depth) are present!")
+                    print("Verification: All required schema keys (including code audit and refactor keys) are present!")
                 else:
                     print(f"Verification FAILED: Missing keys. Found {keys}")
         else:

@@ -571,9 +571,10 @@ async def global_radar(country: str = "All", limit: int = 5, source: str = "ALL"
 async def generate_blueprint_card(
     client: genai.Client | None,
     user_stack: List[str],
-    repo_map: Dict[str, List[str]],
     deep_dependencies: List[str],
-    startup: Dict[str, Any]
+    startup: Dict[str, Any],
+    file_path: str = "None",
+    raw_source_code: str = "No complex file found."
 ) -> Dict[str, Any]:
     startup_name = startup.get("name", "Unknown")
     startup_desc = startup.get("description") or startup.get("raw_description") or ""
@@ -583,12 +584,10 @@ async def generate_blueprint_card(
         desc = startup_desc.lower()
         matching = []
         missing = []
-        proof_repos = []
         
         for lang in user_stack:
             if lang.lower() in desc:
                 matching.append(lang)
-                proof_repos.extend(repo_map.get(lang, []))
             else:
                 missing.append(lang)
                 
@@ -614,9 +613,12 @@ async def generate_blueprint_card(
             "match_percentage": match_percentage,
             "matching_skills": matching,
             "missing_skills": missing,
-            "proof_repos": list(set(proof_repos)),
             "infrastructure_depth": inf_depth,
-            "diagnostic_log": f"Offline diagnostic profile completed for {startup_name} using raw developer stack heuristics."
+            "diagnostic_log": f"Offline diagnostic profile completed for {startup_name} using raw developer stack heuristics.",
+            "audited_file": file_path,
+            "code_review_log": "Offline fallback: The file analysis is pending live connection. Make sure that the selected code block is modular, cleanly typed, and follows standard separation of concerns.",
+            "interview_question": f"How would you optimize and scale the system components of this module to handle a 10x spike in daily traffic at {startup_name}?",
+            "recommended_refactor": f"// Recommended Refactor Fallback\n// Maintain strong encapsulation and dependency injection\nexport function optimizeModule(config) {{\n  return {{ ...config, optimized: true }};\n}}"
         }
 
     if not client:
@@ -625,28 +627,40 @@ async def generate_blueprint_card(
     prompt = f"""
 [SOURCE VARIABLE: USER REPOSITORIES AND ALL EXTRACTED CONFIG DEPENDENCIES]
 User Tech Stack: {json.dumps(user_stack)}
-User Repo Map (maps language to repository names): {json.dumps(repo_map)}
 User Deep Dependencies (frameworks extracted from package.json/requirements.txt): {json.dumps(deep_dependencies)}
 
 [TARGET VARIABLE: STARTUP DATA RECRUITMENT NODES]
 - Company Name: {startup_name}
 - Company Target Specs / Job Description: {startup_desc}
 
+[SOURCE VARIABLE: USER CODE FILE AUDIT]
+File Path: {file_path}
+Raw Source Code Content:
+{raw_source_code}
+
 OPERATIONAL INSTRUCTIONS:
 - Calculate an objective 'match_percentage' (0 to 100) based on actual tech-stack convergence. Do not default to 0% if similarities exist.
 - For 'infrastructure_depth', read the TARGET STARTUP's description and determine their tech framework. Do NOT copy the user's config dependencies into this field.
+- Act as a brutal, highly precise Senior Engineering Manager from the target startup: {startup_name}.
+  Analyze the provided source code file ({file_path}) from the user's repository.
+  Produce the architectural critique (`code_review_log`), interview question (`interview_question`), and refactor suggestion (`recommended_refactor`).
 """
 
     system_instruction = (
-        "You are a deterministic technical matching parser. Compare the user's tech stack against the target startup. "
-        "Output a RAW JSON object with exactly these keys: "
-        "\"startup_name\" (string), "
-        "\"match_percentage\" (integer 0-100), "
-        "\"matching_skills\" (array of strings), "
-        "\"missing_skills\" (array of strings), "
-        "\"proof_repos\" (array of strings containing the exact repository names that prove the matching skills), "
-        "\"infrastructure_depth\" (a 1-sentence string where you explicitly call out the advanced frameworks/packages you detected in the target startup description), "
-        "\"diagnostic_log\" (1-sentence string)."
+        "You are acting as a brutal, highly precise Senior Engineering Manager from the target startup: "
+        f"{startup_name}. Compare the user's tech profile, and analyze this specific source code file ({file_path}) "
+        f"from the user's repository:\n{raw_source_code}\n"
+        "Generate a strict technical JSON response containing these keys:\n"
+        "- `startup_name` (string)\n"
+        "- `match_percentage` (integer 0-100)\n"
+        "- `matching_skills` (array of strings)\n"
+        "- `missing_skills` (array of strings)\n"
+        "- `infrastructure_depth` (a 1-sentence string where you explicitly call out the advanced frameworks/packages you detected in the target startup description)\n"
+        "- `diagnostic_log` (1-sentence string)\n"
+        "- `audited_file` (string: the name of the file reviewed)\n"
+        "- `code_review_log` (string: a 3-sentence deep architectural critique of this specific file. Point out potential memory leaks, unoptimized loops, typing issues, or scalability constraints)\n"
+        "- `interview_question` (string: the exact technical interview question you would ask them about this specific code block during a live systems design interview)\n"
+        "- `recommended_refactor` (string: a short snippet of how they should rewrite a portion of their file to match production standards)."
     )
 
     try:
@@ -662,7 +676,7 @@ OPERATIONAL INSTRUCTIONS:
         response_text = response.text.strip() if response.text else "{}"
         try:
             blueprint_card = json.loads(response_text)
-            required_keys = {"startup_name", "match_percentage", "matching_skills", "missing_skills", "proof_repos", "infrastructure_depth", "diagnostic_log"}
+            required_keys = {"startup_name", "match_percentage", "matching_skills", "missing_skills", "infrastructure_depth", "diagnostic_log", "audited_file", "code_review_log", "interview_question", "recommended_refactor"}
             if isinstance(blueprint_card, dict) and required_keys.issubset(blueprint_card.keys()):
                 blueprint_card["match_percentage"] = int(blueprint_card["match_percentage"])
                 blueprint_card["startup_description"] = startup_desc
@@ -680,7 +694,6 @@ OPERATIONAL INSTRUCTIONS:
 async def generate_viral_assets(
     client: genai.Client | None,
     user_stack: List[str],
-    repo_map: Dict[str, List[str]],
     deep_dependencies: List[str]
 ) -> Dict[str, Any]:
     def get_fallback():
@@ -713,7 +726,6 @@ async def generate_viral_assets(
     prompt = f"""
 [USER DEVELOPER PROFILE DATA]
 - Tech Stack (Languages): {json.dumps(user_stack)}
-- Repositories by Language: {json.dumps(repo_map)}
 - Deep Dependencies (Frameworks/Libraries): {json.dumps(deep_dependencies)}
 
 OPERATIONAL INSTRUCTIONS:
@@ -771,23 +783,79 @@ async def get_blueprint(github_username: str, limit: int = 5):
         res.raise_for_status()
         repos = res.json()
 
-        # 2. Extract unique programming languages and map repositories (safe parsing)
-        repo_map = {}
+        # 1.1 Isolate most recently updated repository and fetch a complex file from its tree
+        repo_name = None
+        if isinstance(repos, list) and len(repos) > 0:
+            for r in repos:
+                if isinstance(r, dict) and r.get("name"):
+                    repo_name = r["name"]
+                    break
+
+        file_path = "None"
+        raw_source_code = "No complex file found."
+
+        if repo_name:
+            try:
+                tree_url = f"https://api.github.com/repos/{github_username}/{repo_name}/git/trees/main?recursive=1"
+                tree_headers = {"User-Agent": "Global-Radar-App"}
+                if github_token:
+                    tree_headers["Authorization"] = f"token {github_token}"
+                
+                tree_res = await asyncio.to_thread(requests.get, tree_url, headers=tree_headers, timeout=10)
+                if tree_res.status_code == 404:
+                    # Fallback to master branch
+                    tree_url = f"https://api.github.com/repos/{github_username}/{repo_name}/git/trees/master?recursive=1"
+                    tree_res = await asyncio.to_thread(requests.get, tree_url, headers=tree_headers, timeout=10)
+
+                if tree_res.status_code == 200:
+                    tree_data = tree_res.json()
+                    tree_files = tree_data.get("tree", [])
+                    
+                    complex_extensions = (".ts", ".tsx", ".js", ".jsx", ".py")
+                    ignored_dirs = ("node_modules/", "dist/", "build/", ".git/")
+                    ignored_files = ("next.config.js", "next.config.ts", "vite.config.js", "vite.config.ts", "tailwind.config.js", "eslint.config.js", "eslint.config.mjs", "setup.py", "manage.py")
+                    
+                    target_file_path = None
+                    for item in tree_files:
+                        path_str = item.get("path", "")
+                        type_str = item.get("type", "")
+                        if type_str == "blob" and path_str.lower().endswith(complex_extensions):
+                            if any(ignored in path_str for ignored in ignored_dirs):
+                                continue
+                            file_name = path_str.split("/")[-1]
+                            if file_name in ignored_files:
+                                continue
+                            target_file_path = path_str
+                            break
+
+                    if target_file_path:
+                        raw_url = f"https://api.github.com/repos/{github_username}/{repo_name}/contents/{target_file_path}"
+                        raw_headers = {
+                            "Accept": "application/vnd.github.v3.raw",
+                            "User-Agent": "Global-Radar-App"
+                        }
+                        if github_token:
+                            raw_headers["Authorization"] = f"token {github_token}"
+                        
+                        raw_res = await asyncio.to_thread(requests.get, raw_url, headers=raw_headers, timeout=10)
+                        if raw_res.status_code == 200:
+                            file_path = f"{repo_name}/{target_file_path}"
+                            lines = raw_res.text.splitlines()
+                            raw_source_code = "\n".join(lines[:300])
+            except Exception as e:
+                logger.error(f"Error executing GitHub Tree/Content fetching for {repo_name}: {e}")
+
+        # 2. Extract unique programming languages (safe parsing)
         languages = set()
         if isinstance(repos, list):
             for repo in repos:
                 if not isinstance(repo, dict):
                     continue
                 lang = repo.get("language")
-                repo_name = repo.get("name")
-                if lang and isinstance(lang, str) and repo_name and isinstance(repo_name, str):
+                if lang and isinstance(lang, str):
                     languages.add(lang)
-                    if lang not in repo_map:
-                        repo_map[lang] = []
-                    if repo_name not in repo_map[lang]:
-                        repo_map[lang].append(repo_name)
         user_stack = list(languages)
-        logger.info(f"Extracted user tech stack: {user_stack}, repo_map: {repo_map}")
+        logger.info(f"Extracted user tech stack: {user_stack}")
 
         # Deep Scan Loop for top 3 most recently updated repos
         top_repos = repos[:3] if isinstance(repos, list) else []
@@ -890,10 +958,10 @@ async def get_blueprint(github_username: str, limit: int = 5):
         # Execute parallel generation calls for each selected startup and viral assets
         logger.info(f"Generating blueprint cards and viral assets...")
         blueprint_tasks = [
-            generate_blueprint_card(client, user_stack, repo_map, deep_dependencies_list, startup)
+            generate_blueprint_card(client, user_stack, deep_dependencies_list, startup, file_path, raw_source_code)
             for startup in formatted_startups
         ]
-        viral_task = generate_viral_assets(client, user_stack, repo_map, deep_dependencies_list)
+        viral_task = generate_viral_assets(client, user_stack, deep_dependencies_list)
 
         blueprint, viral_assets = await asyncio.gather(
             asyncio.gather(*blueprint_tasks),
